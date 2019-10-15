@@ -14,6 +14,22 @@ STATE_IN_PROCESS = 1
 STATE_FINALIZED = 2
 
 
+def eprint(*args, **kwargs):
+    print(*args, **kwargs, file=sys.stderr)
+
+
+def info(*args, **kwargs):
+    print('\x1b[34m\x1b[1m', file=sys.stderr, end='')
+    print(*args, **kwargs, file=sys.stderr, end='')
+    print('\x1b[0m', file=sys.stderr)
+
+
+def error(*args, **kwargs):
+    print('\x1b[31m\x1b[1m', file=sys.stderr, end='')
+    print(*args, **kwargs, file=sys.stderr, end='')
+    print('\x1b[0m', file=sys.stderr)
+
+
 class PaddingDetails(object):
     def __init__(self, prev_field, next_field):
         self.prev_field = prev_field
@@ -260,7 +276,7 @@ class EnumType(Type):
         # Adding 2 empty lines in order to comply w/ PEP8
         fp.write(f'class {self.name}(EnumClass):\n')
 
-        for name, value in self.literals.values():
+        for name, value in self.literals.items():
             # Output the member itself
             fp.write(f'    {name} = {value}\n')
 
@@ -405,19 +421,23 @@ class Pointer(Type):
 
     def do_finalize(self, types, finalization_order):
         if self.item_type is not None:
+            types[self.item_type].finalize(types, finalization_order)
             self.item_type = types[self.item_type]
 
     def has_padding(self):
         return False
 
-    def __repr__(self):
-        return self.name
-
     def get_hydras_type(self):
-        return 'ptr_int_for_kaplan_todo'
+        ptr_type = {4: 'uint32_t', 8: 'uint64_t'}[self.byte_size]
+        return f'{ptr_type}  # <POINTER>'
 
     def __eq__(self, other):
         return isinstance(other, Pointer) and other.name == self.name and other.item_type == self.item_type
+
+    def __repr__(self):
+        if self.item_type is None:
+            return 'void *'
+        return f'{repr(self.item_type)} *'
 
 
 class ConstType(Type):
@@ -432,20 +452,23 @@ class ConstType(Type):
 
     def do_finalize(self, types, finalization_order):
         if self.item_type is not None:
+            types[self.item_type].finalize(types, finalization_order)
             self.item_type = types[self.item_type]
         self.byte_size = self.item_type.byte_size
 
     def has_padding(self):
         return self.item_type.has_padding()
 
-    def __repr__(self):
-        return self.name
-
     def get_hydras_type(self):
         return self.item_type.get_hydras_type()
 
     def __eq__(self, other):
         return isinstance(other, ConstType) and other.name == self.name and other.item_type == self.item_type
+
+    def __repr__(self):
+        if self.item_type is None:
+            return 'const void'
+        return f'const {repr(self.item_type)}'
 
 
 class UnsupportedType(Type):
@@ -458,10 +481,6 @@ class UnsupportedType(Type):
 
     def has_padding(self):
         return False
-
-    def __repr__(self):
-        return self.name
-
     def get_hydras_type(self):
         return None
 
@@ -471,7 +490,7 @@ def parse_dwarf_info(elf):
     for cu in elf.get_dwarf_info().iter_CUs():
         types = {}
         cu_name = cu.get_top_DIE().attributes['DW_AT_name'].value.decode('utf-8')
-        print('\x1b[32m\x1b[1mProcessing %s\x1b[0m' % cu_name, file=sys.stderr)
+        info(f'Processing {cu_name}')
 
         # First, map top level types
         for die in cu.iter_DIEs():
@@ -535,7 +554,7 @@ def main():
     with open(args.input_file, 'rb') as f:
         elf = ELFFile(f)
         if not elf.has_dwarf_info():
-            print("Object file has no dwarf info!", file=sys.stderr)
+            error("Object file has no dwarf info!")
             sys.exit(1)
 
         all_structs = []
@@ -560,13 +579,18 @@ def main():
                 for st in all_structs:
                     if st.name == s.name:
                         same_named_type = st
+                        break
 
                 if same_named_type is None:
-                    print(f'>> Duplicate type for \x1b[32m{s.name}\x1b[0m', file=sys.stderr)
+                    info(f'>> Duplicate type for {s.name}')
                     all_structs.append(s)
                 elif same_named_type != s:
-                    print(f'\x1b[31m\x1b[1mConflicting definitions for type `{s.name}`\x1b[0m', file=sys.stderr)
-                    assert same_named_type == s
+                    error(f'Conflicting definitions for type `{s.name}`')
+                    info(f'First occurrence:')
+                    eprint(repr(s))
+                    info(f'Second occurrence:')
+                    eprint(repr(same_named_type))
+                    sys.exit(1)
 
         output = sys.stdout
         if args.output is not None:
