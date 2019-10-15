@@ -36,7 +36,7 @@ class Type(object):
         self.byte_size = None
         self.state = STATE_INITIAL
 
-    def finalize(self, types):
+    def finalize(self, types, finalization_order):
         if self.state == STATE_FINALIZED:
             return
 
@@ -44,10 +44,11 @@ class Type(object):
             raise RuntimeError("Type cycle detected")
 
         self.state = STATE_IN_PROCESS
-        self.do_finalize(types)
+        self.do_finalize(types, finalization_order)
+        finalization_order.append(self)
         self.state = STATE_FINALIZED
 
-    def do_finalize(self, types):
+    def do_finalize(self, types, finalization_order):
         pass
 
     def has_padding(self):
@@ -69,7 +70,18 @@ class Type(object):
         file_name = os.path.join(comp_dir, file_name)
         return file_name
 
-    def get_hydra_type(self):
+    def get_hydras_type(self):
+        pass
+
+    def needs_to_generate_hydra(self) -> bool:
+        return False
+
+    def generate_hydras_definition(self, fp: TextIO):
+        """
+        Generates top-level definitions for this type if needed.
+
+        :param fp: Output text stream
+        """
         pass
 
 
@@ -84,7 +96,7 @@ class Primitive(Type):
     def __repr__(self):
         return self.name
 
-    def get_hydra_type(self):
+    def get_hydras_type(self):
         if self.name in ['float', 'double']:
             return self.name.capitalize()
 
@@ -125,11 +137,11 @@ class Struct(Type):
                 member_name = '<unnamed>'
             self.members.append((member_offset, type_num, member_name))
 
-    def do_finalize(self, types):
+    def do_finalize(self, types, finalization_order):
         new_members = []
 
         for offset, type_num, member_name in self.members:
-            types[type_num].finalize(types)
+            types[type_num].finalize(types, finalization_order)
             new_members.append((offset, types[type_num], member_name))
 
         self.members = new_members
@@ -165,7 +177,7 @@ class Struct(Type):
 
         return self.name + '(%s)' % ', '.join(map(lambda m: str(m[1]), self.members))
 
-    def get_hydra_type(self):
+    def get_hydras_type(self):
         return self.name
 
     def __eq__(self, other):
@@ -173,6 +185,30 @@ class Struct(Type):
                other.byte_size == self.byte_size and \
                other.members == self.members and \
                other.name == self.name
+
+    def needs_to_generate_hydra(self) -> bool:
+        return True
+
+    def generate_hydras_definition(self, fp: TextIO):
+        padding_counter = 0
+        last_ending_offset = 0
+
+        # Adding 2 empty lines in order to comply w/ PEP8
+        fp.write(f'class {self.name}(Struct):\n')
+
+        for offset, member_type, member_name in self.members:
+            # Generate entries for compiler introduced padding
+            if last_ending_offset < offset:
+                fp.write(f'    _padding_{padding_counter} = Pad({offset - last_ending_offset})\n')
+                padding_counter += 1
+            last_ending_offset = offset + member_type.byte_size
+
+            # Output the member itself
+            fp.write(f'    {member_name} = {member_type.get_hydras_type()}\n')
+
+        # The compiler can also generate postfix padding.
+        if last_ending_offset != self.byte_size:
+            fp.write(f'    _padding_{padding_counter} = Pad({self.byte_size - last_ending_offset})\n')
 
 
 class Array(Type):
@@ -188,11 +224,11 @@ class Array(Type):
                 dimension = c.attributes['DW_AT_upper_bound'].value + 1
                 self.dimensions.append(dimension)
 
-    def do_finalize(self, types):
+    def do_finalize(self, types, finalization_order):
         # assert len(self.dimensions) > 0
 
         self.item_type = types[self.item_type]
-        self.item_type.finalize(types)
+        self.item_type.finalize(types, finalization_order)
         self.byte_size = self.item_type.byte_size
         for d in self.dimensions:
             self.byte_size *= d
@@ -213,8 +249,8 @@ class Array(Type):
 
         return base_type
 
-    def get_hydra_type(self):
-        t = self.item_type.get_hydra_type()
+    def get_hydras_type(self):
+        t = self.item_type.get_hydras_type()
         for d in self.dimensions[::-1]:
             t = f'Array({d}, {t})'
 
@@ -236,10 +272,10 @@ class Typedef(Type):
             # Probably `void`
             self.alias = None
 
-    def do_finalize(self, types):
+    def do_finalize(self, types, finalization_order):
         if self.alias is not None:
             self.alias = types[self.alias]
-            self.alias.finalize(types)
+            self.alias.finalize(types, finalization_order)
             self.byte_size = self.alias.byte_size
 
     def has_padding(self):
@@ -248,11 +284,21 @@ class Typedef(Type):
     def __repr__(self):
         return self.name
 
-    def get_hydra_type(self):
+    def get_hydras_type(self):
         return self.name
 
     def __eq__(self, other):
         return isinstance(other, Typedef) and other.name == self.name and other.alias == self.alias
+
+    def needs_to_generate_hydra(self) -> bool:
+        # Skip generation of common Hydras typedefs
+        return not bool(re.match(r'u?int(8|16|32|64)_t', self.name))
+
+    def generate_hydras_definition(self, fp: TextIO):
+        if not self.needs_to_generate_hydra():
+            return
+
+        fp.write(f'{self.name} = {self.alias.get_hydras_type()}\n')
 
 
 class Pointer(Type):
@@ -266,7 +312,7 @@ class Pointer(Type):
             # Probably `void`
             self.item_type = None
 
-    def do_finalize(self, types):
+    def do_finalize(self, types, finalization_order):
         if self.item_type is not None:
             self.item_type = types[self.item_type]
 
@@ -276,7 +322,7 @@ class Pointer(Type):
     def __repr__(self):
         return self.name
 
-    def get_hydra_type(self):
+    def get_hydras_type(self):
         return 'ptr_int_for_kaplan_todo'
 
     def __eq__(self, other):
@@ -293,7 +339,7 @@ class ConstType(Type):
             # Probably `void`
             self.item_type = None
 
-    def do_finalize(self, types):
+    def do_finalize(self, types, finalization_order):
         if self.item_type is not None:
             self.item_type = types[self.item_type]
         self.byte_size = self.item_type.byte_size
@@ -304,8 +350,8 @@ class ConstType(Type):
     def __repr__(self):
         return self.name
 
-    def get_hydra_type(self):
-        return self.item_type.get_hydra_type()
+    def get_hydras_type(self):
+        return self.item_type.get_hydras_type()
 
     def __eq__(self, other):
         return isinstance(other, ConstType) and other.name == self.name and other.item_type == self.item_type
@@ -332,10 +378,10 @@ class EnumType(Type):
             # Probably `void`
             assert False, 'TODO'
 
-    def do_finalize(self, types):
+    def do_finalize(self, types, finalization_order):
         if self.item_type is not None:
             self.item_type = types[self.item_type]
-            self.item_type.finalize(types)
+            self.item_type.finalize(types, finalization_order)
             self.byte_size = self.item_type.byte_size
 
     def has_padding(self):
@@ -344,7 +390,7 @@ class EnumType(Type):
     def __repr__(self):
         return self.name
 
-    def get_hydra_type(self):
+    def get_hydras_type(self):
         return self.name
 
     def __eq__(self, other):
@@ -371,9 +417,9 @@ class UnionType(Type):
             value = variant.attributes['DW_AT_type'].value
             self.variants[name] = value
 
-    def do_finalize(self, types):
+    def do_finalize(self, types, finalization_order):
         for name, variant in self.variants.items():
-            types[variant].finalize(types)
+            types[variant].finalize(types, finalization_order)
             self.variants[name] = types[variant]
 
     def has_padding(self):
@@ -382,7 +428,7 @@ class UnionType(Type):
     def __repr__(self):
         return self.name
 
-    def get_hydra_type(self):
+    def get_hydras_type(self):
         return self.name
 
     def __eq__(self, other):
@@ -396,7 +442,7 @@ class UnsupportedType(Type):
         super().__init__(die)
         self.die = die
 
-    def do_finalize(self, types):
+    def do_finalize(self, types, finalization_order):
         pass
 
     def has_padding(self):
@@ -405,7 +451,7 @@ class UnsupportedType(Type):
     def __repr__(self):
         return self.name
 
-    def get_hydra_type(self):
+    def get_hydras_type(self):
         return None
 
 
@@ -435,6 +481,7 @@ def parse_dwarf_info(elf):
                 assert offset not in types
                 types[offset] = common_types[die.tag](die)
             else:
+                # We still mark types of unsupported DIEs for easier diagnostics.
                 types[offset] = UnsupportedType(die)
 
         translation_units[cu] = types
@@ -443,38 +490,28 @@ def parse_dwarf_info(elf):
 
 
 def generate_hydra_file(structs, fp: TextIO):
-    # Typedefs are generated only if used.
-    typedefs = []
-    struct_lines = []
+    fp.write('from hydras import *\n')
 
+    last_generated_type = None
     for struct in structs:
+        if not struct.needs_to_generate_hydra():
+            continue
 
-        padding_counter = 0
-        last_ending_offset = 0
+        # If anything was generated from the last struct, insert 2 line-feeds to conform to PEP8 ...
+        # ... unless both of them are typedefs.
+        if not (isinstance(struct, Typedef) and isinstance(last_generated_type, Typedef)):
+            fp.write('\n\n')
 
-        # Adding 2 empty lines in order to comply w/ PEP8
-        struct_lines.append(f'\n\nclass {struct.name}(Struct):')
+        struct.generate_hydras_definition(fp)
 
-        for offset, member_type, member_name in struct.members:
-            # Collect typedefs, but skip definition of standard types.
-            if isinstance(member_type, Typedef) and not re.match('u?int[0-9]{1,2}_t', member_type.name):
-                typedefs.append(f'{member_type.name} = {member_type.alias.get_hydra_type()}')
-
-            if last_ending_offset < offset:
-                struct_lines.append(f'    _padding_{padding_counter} = Pad({offset - last_ending_offset})')
-                padding_counter += 1
-            last_ending_offset = offset + member_type.byte_size
-
-            struct_lines.append(f'    {member_name} = {member_type.get_hydra_type()}')
-    fp.write('from hydras import *\n\n')
-    fp.write('\n'.join(typedefs + struct_lines))
+        last_generated_type = struct
 
 
 def main():
     args = argparse.ArgumentParser(description='Parses an ELF file with DWARF debug symbols and generates Hydra '
                                                'definitions for the selected structs.'
                                                ''
-                                               'If no whitelist patterns are specified, all parseable structs will be printed.')
+                                               'If no whitelist patterns are specified, no structs will be printed.')
     args.add_argument('input_file', help='Path to the input ELF file.')
     args.add_argument('--whitelist', help='A regex pattern used to choose structs for generation.'
                                           'May be specified multiple times.',
@@ -492,27 +529,30 @@ def main():
 
         all_structs = []
         for cu, cu_types in parse_dwarf_info(elf).items():
-            generation_order = []
-            whitelist = (t for t in cu_types.values() if t.name is not None and any(p.match(t.name) for p in patterns))
+            finalization_order = []
 
-            for s in whitelist:
+            for s in cu_types.values():
+                if s.name is None or not any(p.match(s.name) for p in patterns):
+                    continue
                 # Translate type offset into object-references.
-                s.finalize(cu_types)
+                s.finalize(cu_types, finalization_order)
 
+            for s in finalization_order:
                 # We can get the same struct definition from different translation units
                 # So if the current struct in the current translation unit was already processed,
                 # do not add it to the list, but make sure the definitions are consistent.
                 # We also avoid creating a list of the result
-                same_named_struct = None
+                same_named_type = None
                 for st in all_structs:
                     if st.name == s.name:
-                        same_named_struct = st
+                        same_named_type = st
 
-                if same_named_struct is None:
+                if same_named_type is None:
+                    print(f'>> \x1b[32m{s.name}\x1b[0m', file=sys.stderr)
                     all_structs.append(s)
-                elif same_named_struct != s:
+                elif same_named_type != s:
                     print(f'\x1b[34mConflicting definitions for struct `{s.name}`\x1b[0m', file=sys.stderr)
-                    assert same_named_struct == s
+                    assert same_named_type == s
 
         output = sys.stdout
         if args.output is not None:
