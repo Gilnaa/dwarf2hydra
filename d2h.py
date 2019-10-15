@@ -94,6 +94,11 @@ class Primitive(Type):
         else:
             return f'int{bitsize}_t'
 
+    def __eq__(self, other):
+        return isinstance(other, Primitive) and \
+               other.byte_size == self.byte_size and \
+               other.name == self.name
+
 
 class Struct(Type):
     def __init__(self, die: DIE):
@@ -163,6 +168,12 @@ class Struct(Type):
     def get_hydra_type(self):
         return self.name
 
+    def __eq__(self, other):
+        return isinstance(other, Struct) and \
+               other.byte_size == self.byte_size and \
+               other.members == self.members and \
+               other.name == self.name
+
 
 class Array(Type):
     def __init__(self, die: DIE):
@@ -209,6 +220,9 @@ class Array(Type):
 
         return t
 
+    def __eq__(self, other):
+        return isinstance(other, Array) and other.dimensions == self.dimensions and other.item_type == self.item_type
+
 
 class Typedef(Type):
     def __init__(self, die: DIE):
@@ -237,6 +251,9 @@ class Typedef(Type):
     def get_hydra_type(self):
         return self.name
 
+    def __eq__(self, other):
+        return isinstance(other, Typedef) and other.name == self.name and other.alias == self.alias
+
 
 class Pointer(Type):
     def __init__(self, die: DIE):
@@ -262,6 +279,9 @@ class Pointer(Type):
     def get_hydra_type(self):
         return 'ptr_int_for_kaplan_todo'
 
+    def __eq__(self, other):
+        return isinstance(other, Pointer) and other.name == self.name and other.item_type == self.item_type
+
 
 class ConstType(Type):
     def __init__(self, die: DIE):
@@ -286,6 +306,9 @@ class ConstType(Type):
 
     def get_hydra_type(self):
         return self.item_type.get_hydra_type()
+
+    def __eq__(self, other):
+        return isinstance(other, ConstType) and other.name == self.name and other.item_type == self.item_type
 
 
 class EnumType(Type):
@@ -324,6 +347,49 @@ class EnumType(Type):
     def get_hydra_type(self):
         return self.name
 
+    def __eq__(self, other):
+        return isinstance(other, EnumType) and \
+               other.name == self.name and \
+               other.item_type == self.item_type and \
+               other.literals == self.literals
+
+
+class UnionType(Type):
+    def __init__(self, die: DIE):
+        super().__init__(die)
+
+        self.name = '<unnamed-enum>'
+        if 'DW_AT_name' in die.attributes:
+            self.name = die.attributes['DW_AT_name'].value.decode('utf-8')
+
+        self.byte_size = die.attributes['DW_AT_byte_size'].value
+
+        self.variants = OrderedDict()
+        for variant in die.iter_children():
+            assert variant.tag == 'DW_TAG_member'
+            name = variant.attributes['DW_AT_name'].value.decode('utf-8')
+            value = variant.attributes['DW_AT_type'].value
+            self.variants[name] = value
+
+    def do_finalize(self, types):
+        for name, variant in self.variants.items():
+            types[variant].finalize(types)
+            self.variants[name] = types[variant]
+
+    def has_padding(self):
+        return any(v.has_padding() for v in self.variants.values())
+
+    def __repr__(self):
+        return self.name
+
+    def get_hydra_type(self):
+        return self.name
+
+    def __eq__(self, other):
+        return isinstance(other, UnionType) and \
+               other.name == self.name and \
+               other.variants == self.variants
+
 
 class UnsupportedType(Type):
     def __init__(self, die: DIE):
@@ -361,6 +427,7 @@ def parse_dwarf_info(elf):
                 'DW_TAG_pointer_type': Pointer,
                 'DW_TAG_const_type': ConstType,
                 'DW_TAG_enumeration_type': EnumType,
+                'DW_TAG_union_type': UnionType,
             }
 
             offset = die.offset - cu.cu_offset
@@ -425,14 +492,27 @@ def main():
 
         all_structs = []
         for cu, cu_types in parse_dwarf_info(elf).items():
-            structs = (t for t in cu_types.values() if isinstance(t, Struct))
-            if len(patterns) > 0:
-                structs = (t for t in structs if t.name is not None and any(p.match(t.name) for p in patterns))
+            generation_order = []
+            whitelist = (t for t in cu_types.values() if t.name is not None and any(p.match(t.name) for p in patterns))
 
-            # Translate type offset into object-references.
-            for s in structs:
+            for s in whitelist:
+                # Translate type offset into object-references.
                 s.finalize(cu_types)
-                all_structs.append(s)
+
+                # We can get the same struct definition from different translation units
+                # So if the current struct in the current translation unit was already processed,
+                # do not add it to the list, but make sure the definitions are consistent.
+                # We also avoid creating a list of the result
+                same_named_struct = None
+                for st in all_structs:
+                    if st.name == s.name:
+                        same_named_struct = st
+
+                if same_named_struct is None:
+                    all_structs.append(s)
+                elif same_named_struct != s:
+                    print(f'\x1b[34mConflicting definitions for struct `{s.name}`\x1b[0m', file=sys.stderr)
+                    assert same_named_struct == s
 
         output = sys.stdout
         if args.output is not None:
