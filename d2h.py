@@ -5,7 +5,7 @@ import sys
 import argparse
 from elftools.elf.elffile import ELFFile
 from elftools.dwarf.die import DIE
-from typing import TextIO
+from typing import TextIO, List
 from collections import OrderedDict
 
 # Type States
@@ -51,6 +51,9 @@ class Type(object):
         self.name = None
         self.byte_size = None
         self.state = STATE_INITIAL
+
+    def get_type_dependencies(self) -> List[int]:
+        return []
 
     def finalize(self, types, finalization_order):
         if self.state == STATE_FINALIZED:
@@ -162,6 +165,9 @@ class Struct(Type):
 
         self.members = new_members
 
+    def get_type_dependencies(self):
+        return (type_num for _, type_num, _ in self.members)
+
     def has_padding(self):
         return self.byte_size != sum(map(lambda dm: dm[1].byte_size, self.members)) or \
             any(map(lambda dm: dm[1].has_padding(), self.members))
@@ -248,6 +254,9 @@ class EnumType(Type):
             # Probably `void`
             assert False, 'TODO'
 
+    def get_type_dependencies(self):
+        return [self.item_type]
+
     def do_finalize(self, types, finalization_order):
         if self.item_type is not None:
             self.item_type = types[self.item_type]
@@ -285,7 +294,7 @@ class UnionType(Type):
     def __init__(self, die: DIE):
         super().__init__(die)
 
-        self.name = '<unnamed-enum>'
+        self.name = '<unnamed-union>'
         if 'DW_AT_name' in die.attributes:
             self.name = die.attributes['DW_AT_name'].value.decode('utf-8')
 
@@ -302,6 +311,9 @@ class UnionType(Type):
         for name, variant in self.variants.items():
             types[variant].finalize(types, finalization_order)
             self.variants[name] = types[variant]
+
+    def get_type_dependencies(self):
+        return self.variants.values()
 
     def has_padding(self):
         return any(v.has_padding() for v in self.variants.values())
@@ -339,6 +351,9 @@ class Array(Type):
         self.byte_size = self.item_type.byte_size
         for d in self.dimensions:
             self.byte_size *= d
+
+    def get_type_dependencies(self):
+        return [self.item_type]
 
     def has_padding(self):
         return self.item_type.has_padding()
@@ -385,6 +400,9 @@ class Typedef(Type):
             self.alias.finalize(types, finalization_order)
             self.byte_size = self.alias.byte_size
 
+    def get_type_dependencies(self):
+        return [self.alias]
+
     def has_padding(self):
         return self.alias.has_padding()
 
@@ -424,11 +442,14 @@ class Pointer(Type):
             types[self.item_type].finalize(types, finalization_order)
             self.item_type = types[self.item_type]
 
+    def get_type_dependencies(self):
+        return [self.item_type]
+
     def has_padding(self):
         return False
 
     def get_hydras_type(self):
-        ptr_type = {4: 'uint32_t', 8: 'uint64_t'}[self.byte_size]
+        ptr_type = {4:  'uint32_t', 8: 'uint64_t'}[self.byte_size]
         return f'{ptr_type}  # <POINTER>'
 
     def __eq__(self, other):
@@ -456,6 +477,9 @@ class ConstType(Type):
             self.item_type = types[self.item_type]
         self.byte_size = self.item_type.byte_size
 
+    def get_type_dependencies(self):
+        return [self.item_type]
+
     def has_padding(self):
         return self.item_type.has_padding()
 
@@ -481,42 +505,82 @@ class UnsupportedType(Type):
 
     def has_padding(self):
         return False
+
     def get_hydras_type(self):
         return None
 
 
-def parse_dwarf_info(elf):
-    translation_units = {}
+TAG_TYPE_MAPPING = {
+    'DW_TAG_structure_type': Struct,
+    'DW_TAG_class_type': Struct,
+    'DW_TAG_base_type': Primitive,
+    'DW_TAG_typedef': Typedef,
+    'DW_TAG_array_type': Array,
+    'DW_TAG_pointer_type': Pointer,
+    'DW_TAG_const_type': ConstType,
+    'DW_TAG_enumeration_type': EnumType,
+    'DW_TAG_union_type': UnionType,
+}
+
+
+def parse_dwarf_info(elf, whitelist_re, skip_duplicated_symbols):
+    # A mapping of `name: type` across all translation units.
+    aggregated_types_by_name = {}
+    # List of types by finalization order
+    finalization_order = []
+
     for cu in elf.get_dwarf_info().iter_CUs():
-        types = {}
         cu_name = cu.get_top_DIE().attributes['DW_AT_name'].value.decode('utf-8')
         info(f'Processing {cu_name}')
 
-        # First, map top level types
-        for die in cu.iter_DIEs():
-            common_types = {
-                'DW_TAG_structure_type': Struct,
-                'DW_TAG_class_type': Struct,
-                'DW_TAG_base_type': Primitive,
-                'DW_TAG_typedef': Typedef,
-                'DW_TAG_array_type': Array,
-                'DW_TAG_pointer_type': Pointer,
-                'DW_TAG_const_type': ConstType,
-                'DW_TAG_enumeration_type': EnumType,
-                'DW_TAG_union_type': UnionType,
-            }
+        # First, we must collect all DIEs into this dictionary so that code
+        # from here-on-out will be able to index into it.
+        dies = {die.offset - cu.cu_offset: die for die in cu.iter_DIEs()}
+        types = {}
 
-            offset = die.offset - cu.cu_offset
-            if die.tag in common_types:
-                assert offset not in types
-                types[offset] = common_types[die.tag](die)
+        # Collect all top-level nodes that are whitelisted and make sure that
+        # all of their dependencies are processed as well.
+        pred = lambda die: 'DW_AT_name' in die.attributes and \
+                           whitelist_re.match(die.attributes['DW_AT_name'].value.decode('utf-8'))
+
+        type_deps_to_process = {offset for offset, die in dies.items() if pred(die)}
+        processed_types = set()
+        while len(type_deps_to_process) > 0:
+            offset = type_deps_to_process.pop()
+            if offset in processed_types:
+                continue
+            processed_types.add(offset)
+
+            die = dies[offset]
+            types[offset] = TAG_TYPE_MAPPING.get(die.tag, UnsupportedType)(die)
+            type_deps_to_process.update(types[offset].get_type_dependencies())
+
+        for offset, typ in types.items():
+            # When the same symbol is defined in multiple Translation-Units,
+            # we perform either of the following:
+            #  - Parse both definitions and make sure they are the same
+            #  - Parse only once and reuse the same definition.
+            if typ.name is not None and typ.name in aggregated_types_by_name:
+                if skip_duplicated_symbols:
+                    types[offset] = aggregated_types_by_name[typ.name]
+                else:
+                    typ.finalize(types, finalization_order)
+                    if typ != aggregated_types_by_name[typ.name]:
+                        error(f'Conflicting definitions for type `{typ.name}`')
+                        info(f'First occurrence:')
+                        eprint(repr(typ))
+                        info(f'Second occurrence:')
+                        eprint(repr(aggregated_types_by_name))
+                        sys.exit(1)
+
             else:
-                # We still mark types of unsupported DIEs for easier diagnostics.
-                types[offset] = UnsupportedType(die)
+                typ.finalize(types, finalization_order)
 
-        translation_units[cu] = types
+        # Update the aggregate
+        for typ in types.values():
+            aggregated_types_by_name[typ.name] = typ
 
-    return translation_units
+    return finalization_order
 
 
 def generate_hydra_file(structs, fp: TextIO):
@@ -549,7 +613,7 @@ def main():
     args.add_argument('-o', '--output', help='Name of output file.')
     args = args.parse_args()
 
-    patterns = [re.compile(pat) for pat in args.whitelist]
+    whitelist_re = re.compile('|'.join(map('(?:{0})'.format, args.whitelist)))
 
     with open(args.input_file, 'rb') as f:
         elf = ELFFile(f)
@@ -557,46 +621,11 @@ def main():
             error("Object file has no dwarf info!")
             sys.exit(1)
 
-        all_structs = []
-        for cu, cu_types in parse_dwarf_info(elf).items():
-            finalization_order = []
-
-            for s in cu_types.values():
-                if s.name is None or not any(p.match(s.name) for p in patterns):
-                    continue
-                # Translate type offset into object-references.
-                s.finalize(cu_types, finalization_order)
-
-            for s in finalization_order:
-                if not s.needs_to_generate_hydra():
-                    continue
-
-                # We can get the same struct definition from different translation units
-                # So if the current struct in the current translation unit was already processed,
-                # do not add it to the list, but make sure the definitions are consistent.
-                # We also avoid creating a list of the result
-                same_named_type = None
-                for st in all_structs:
-                    if st.name == s.name:
-                        same_named_type = st
-                        break
-
-                if same_named_type is None:
-                    info(f'>> Duplicate type for {s.name}')
-                    all_structs.append(s)
-                elif same_named_type != s:
-                    error(f'Conflicting definitions for type `{s.name}`')
-                    info(f'First occurrence:')
-                    eprint(repr(s))
-                    info(f'Second occurrence:')
-                    eprint(repr(same_named_type))
-                    sys.exit(1)
-
         output = sys.stdout
         if args.output is not None:
             output = open(args.output, 'w')
 
-        generate_hydra_file(all_structs, output)
+        generate_hydra_file(parse_dwarf_info(elf, whitelist_re, True), output)
 
 
 if __name__ == '__main__':
