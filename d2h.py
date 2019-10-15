@@ -6,7 +6,7 @@ import argparse
 from elftools.elf.elffile import ELFFile
 from elftools.dwarf.die import DIE
 from typing import TextIO
-
+from collections import OrderedDict
 
 # Type States
 STATE_INITIAL = 0
@@ -72,9 +72,6 @@ class Type(object):
     def get_hydra_type(self):
         pass
 
-    def is_pod(self):
-        return True
-
 
 class Primitive(Type):
     def __init__(self, die: DIE):
@@ -117,7 +114,10 @@ class Struct(Type):
 
             member_offset = c.attributes['DW_AT_data_member_location'].value
             type_num = c.attributes['DW_AT_type'].value
-            member_name = c.attributes['DW_AT_name'].value.decode('utf-8') if c.tag == 'DW_TAG_member' else '<base>'
+            if 'DW_AT_name' in c.attributes:
+                member_name = c.attributes['DW_AT_name'].value.decode('utf-8') if c.tag == 'DW_TAG_member' else '<base>'
+            else:
+                member_name = '<unnamed>'
             self.members.append((member_offset, type_num, member_name))
 
     def do_finalize(self, types):
@@ -160,9 +160,6 @@ class Struct(Type):
 
         return self.name + '(%s)' % ', '.join(map(lambda m: str(m[1]), self.members))
 
-    def is_pod(self):
-        return all((m.is_pod() for _, m, _ in self.members))
-
     def get_hydra_type(self):
         return self.name
 
@@ -184,6 +181,7 @@ class Array(Type):
         # assert len(self.dimensions) > 0
 
         self.item_type = types[self.item_type]
+        self.item_type.finalize(types)
         self.byte_size = self.item_type.byte_size
         for d in self.dimensions:
             self.byte_size *= d
@@ -211,9 +209,6 @@ class Array(Type):
 
         return t
 
-    def is_pod(self):
-        return self.item_type.is_pod()
-
 
 class Typedef(Type):
     def __init__(self, die: DIE):
@@ -230,6 +225,7 @@ class Typedef(Type):
     def do_finalize(self, types):
         if self.alias is not None:
             self.alias = types[self.alias]
+            self.alias.finalize(types)
             self.byte_size = self.alias.byte_size
 
     def has_padding(self):
@@ -240,9 +236,6 @@ class Typedef(Type):
 
     def get_hydra_type(self):
         return self.name
-
-    def is_pod(self):
-        return self.alias.is_pod()
 
 
 class Pointer(Type):
@@ -269,9 +262,6 @@ class Pointer(Type):
     def get_hydra_type(self):
         return 'ptr_int_for_kaplan_todo'
 
-    def is_pod(self):
-        return False
-
 
 class ConstType(Type):
     def __init__(self, die: DIE):
@@ -297,14 +287,66 @@ class ConstType(Type):
     def get_hydra_type(self):
         return self.item_type.get_hydra_type()
 
-    def is_pod(self):
-        return self.item_type.is_pod()
+
+class EnumType(Type):
+    def __init__(self, die: DIE):
+        super().__init__(die)
+
+        self.name = '<unnamed-enum>'
+        if 'DW_AT_name' in die.attributes:
+            self.name = die.attributes['DW_AT_name'].value.decode('utf-8')
+
+        self.literals = OrderedDict()
+        for lit in die.iter_children():
+            assert lit.tag == 'DW_TAG_enumerator'
+            name = lit.attributes['DW_AT_name'].value.decode('utf-8')
+            value = lit.attributes['DW_AT_const_value'].value
+            self.literals[name] = value
+
+        if 'DW_AT_type' in die.attributes:
+            self.item_type = die.attributes['DW_AT_type'].value
+        else:
+            # Probably `void`
+            assert False, 'TODO'
+
+    def do_finalize(self, types):
+        if self.item_type is not None:
+            self.item_type = types[self.item_type]
+            self.item_type.finalize(types)
+            self.byte_size = self.item_type.byte_size
+
+    def has_padding(self):
+        return False
+
+    def __repr__(self):
+        return self.name
+
+    def get_hydra_type(self):
+        return self.name
+
+
+class UnsupportedType(Type):
+    def __init__(self, die: DIE):
+        super().__init__(die)
+        self.die = die
+
+    def do_finalize(self, types):
+        pass
+
+    def has_padding(self):
+        return False
+
+    def __repr__(self):
+        return self.name
+
+    def get_hydra_type(self):
+        return None
 
 
 def parse_dwarf_info(elf):
-    types = {}
-
+    translation_units = {}
     for cu in elf.get_dwarf_info().iter_CUs():
+        types = {}
         cu_name = cu.get_top_DIE().attributes['DW_AT_name'].value.decode('utf-8')
         print('\x1b[32m\x1b[1mProcessing %s\x1b[0m' % cu_name, file=sys.stderr)
 
@@ -317,18 +359,20 @@ def parse_dwarf_info(elf):
                 'DW_TAG_typedef': Typedef,
                 'DW_TAG_array_type': Array,
                 'DW_TAG_pointer_type': Pointer,
-                'DW_TAG_const_type': ConstType
+                'DW_TAG_const_type': ConstType,
+                'DW_TAG_enumeration_type': EnumType,
             }
 
+            offset = die.offset - cu.cu_offset
             if die.tag in common_types:
-                assert die.offset not in types
-                types[die.offset] = common_types[die.tag](die)
+                assert offset not in types
+                types[offset] = common_types[die.tag](die)
+            else:
+                types[offset] = UnsupportedType(die)
 
-        # Then, translate type offset into object-references.
-        for t in types.values():
-            t.finalize(types)
+        translation_units[cu] = types
 
-    return types
+    return translation_units
 
 
 def generate_hydra_file(structs, fp: TextIO):
@@ -379,17 +423,22 @@ def main():
             print("Object file has no dwarf info!", file=sys.stderr)
             sys.exit(1)
 
-        types = parse_dwarf_info(elf)
+        all_structs = []
+        for cu, cu_types in parse_dwarf_info(elf).items():
+            structs = (t for t in cu_types.values() if isinstance(t, Struct))
+            if len(patterns) > 0:
+                structs = (t for t in structs if t.name is not None and any(p.match(t.name) for p in patterns))
+
+            # Translate type offset into object-references.
+            for s in structs:
+                s.finalize(cu_types)
+                all_structs.append(s)
 
         output = sys.stdout
         if args.output is not None:
             output = open(args.output, 'w')
 
-        structs = (t for t in types.values() if isinstance(t, Struct))
-        if len(patterns) > 0:
-            structs = (t for t in structs if any(p.match(t.name) for p in patterns))
-
-        generate_hydra_file(structs, output)
+        generate_hydra_file(all_structs, output)
 
 
 if __name__ == '__main__':
