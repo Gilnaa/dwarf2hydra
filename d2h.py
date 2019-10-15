@@ -211,6 +211,97 @@ class Struct(Type):
             fp.write(f'    _padding_{padding_counter} = Pad({self.byte_size - last_ending_offset})\n')
 
 
+class EnumType(Type):
+    def __init__(self, die: DIE):
+        super().__init__(die)
+
+        self.name = '<unnamed-enum>'
+        if 'DW_AT_name' in die.attributes:
+            self.name = die.attributes['DW_AT_name'].value.decode('utf-8')
+
+        self.literals = OrderedDict()
+        for lit in die.iter_children():
+            assert lit.tag == 'DW_TAG_enumerator'
+            name = lit.attributes['DW_AT_name'].value.decode('utf-8')
+            value = lit.attributes['DW_AT_const_value'].value
+            self.literals[name] = value
+
+        if 'DW_AT_type' in die.attributes:
+            self.item_type = die.attributes['DW_AT_type'].value
+        else:
+            # Probably `void`
+            assert False, 'TODO'
+
+    def do_finalize(self, types, finalization_order):
+        if self.item_type is not None:
+            self.item_type = types[self.item_type]
+            self.item_type.finalize(types, finalization_order)
+            self.byte_size = self.item_type.byte_size
+
+    def has_padding(self):
+        return False
+
+    def __repr__(self):
+        return self.name
+
+    def get_hydras_type(self):
+        return f'{self.name}(type_formatter={self.item_type.get_hydras_type()})'
+
+    def __eq__(self, other):
+        return isinstance(other, EnumType) and \
+               other.name == self.name and \
+               other.item_type == self.item_type and \
+               other.literals == self.literals
+
+    def needs_to_generate_hydra(self) -> bool:
+        return True
+
+    def generate_hydras_definition(self, fp: TextIO):
+        # Adding 2 empty lines in order to comply w/ PEP8
+        fp.write(f'class {self.name}(EnumClass):\n')
+
+        for name, value in self.literals.values():
+            # Output the member itself
+            fp.write(f'    {name} = {value}\n')
+
+
+class UnionType(Type):
+    def __init__(self, die: DIE):
+        super().__init__(die)
+
+        self.name = '<unnamed-enum>'
+        if 'DW_AT_name' in die.attributes:
+            self.name = die.attributes['DW_AT_name'].value.decode('utf-8')
+
+        self.byte_size = die.attributes['DW_AT_byte_size'].value
+
+        self.variants = OrderedDict()
+        for variant in die.iter_children():
+            assert variant.tag == 'DW_TAG_member'
+            name = variant.attributes['DW_AT_name'].value.decode('utf-8')
+            value = variant.attributes['DW_AT_type'].value
+            self.variants[name] = value
+
+    def do_finalize(self, types, finalization_order):
+        for name, variant in self.variants.items():
+            types[variant].finalize(types, finalization_order)
+            self.variants[name] = types[variant]
+
+    def has_padding(self):
+        return any(v.has_padding() for v in self.variants.values())
+
+    def __repr__(self):
+        return self.name
+
+    def get_hydras_type(self):
+        return self.name
+
+    def __eq__(self, other):
+        return isinstance(other, UnionType) and \
+               other.name == self.name and \
+               other.variants == self.variants
+
+
 class Array(Type):
     def __init__(self, die: DIE):
         super().__init__(die)
@@ -357,86 +448,6 @@ class ConstType(Type):
         return isinstance(other, ConstType) and other.name == self.name and other.item_type == self.item_type
 
 
-class EnumType(Type):
-    def __init__(self, die: DIE):
-        super().__init__(die)
-
-        self.name = '<unnamed-enum>'
-        if 'DW_AT_name' in die.attributes:
-            self.name = die.attributes['DW_AT_name'].value.decode('utf-8')
-
-        self.literals = OrderedDict()
-        for lit in die.iter_children():
-            assert lit.tag == 'DW_TAG_enumerator'
-            name = lit.attributes['DW_AT_name'].value.decode('utf-8')
-            value = lit.attributes['DW_AT_const_value'].value
-            self.literals[name] = value
-
-        if 'DW_AT_type' in die.attributes:
-            self.item_type = die.attributes['DW_AT_type'].value
-        else:
-            # Probably `void`
-            assert False, 'TODO'
-
-    def do_finalize(self, types, finalization_order):
-        if self.item_type is not None:
-            self.item_type = types[self.item_type]
-            self.item_type.finalize(types, finalization_order)
-            self.byte_size = self.item_type.byte_size
-
-    def has_padding(self):
-        return False
-
-    def __repr__(self):
-        return self.name
-
-    def get_hydras_type(self):
-        return self.name
-
-    def __eq__(self, other):
-        return isinstance(other, EnumType) and \
-               other.name == self.name and \
-               other.item_type == self.item_type and \
-               other.literals == self.literals
-
-
-class UnionType(Type):
-    def __init__(self, die: DIE):
-        super().__init__(die)
-
-        self.name = '<unnamed-enum>'
-        if 'DW_AT_name' in die.attributes:
-            self.name = die.attributes['DW_AT_name'].value.decode('utf-8')
-
-        self.byte_size = die.attributes['DW_AT_byte_size'].value
-
-        self.variants = OrderedDict()
-        for variant in die.iter_children():
-            assert variant.tag == 'DW_TAG_member'
-            name = variant.attributes['DW_AT_name'].value.decode('utf-8')
-            value = variant.attributes['DW_AT_type'].value
-            self.variants[name] = value
-
-    def do_finalize(self, types, finalization_order):
-        for name, variant in self.variants.items():
-            types[variant].finalize(types, finalization_order)
-            self.variants[name] = types[variant]
-
-    def has_padding(self):
-        return any(v.has_padding() for v in self.variants.values())
-
-    def __repr__(self):
-        return self.name
-
-    def get_hydras_type(self):
-        return self.name
-
-    def __eq__(self, other):
-        return isinstance(other, UnionType) and \
-               other.name == self.name and \
-               other.variants == self.variants
-
-
 class UnsupportedType(Type):
     def __init__(self, die: DIE):
         super().__init__(die)
@@ -538,6 +549,9 @@ def main():
                 s.finalize(cu_types, finalization_order)
 
             for s in finalization_order:
+                if not s.needs_to_generate_hydra():
+                    continue
+
                 # We can get the same struct definition from different translation units
                 # So if the current struct in the current translation unit was already processed,
                 # do not add it to the list, but make sure the definitions are consistent.
@@ -548,10 +562,10 @@ def main():
                         same_named_type = st
 
                 if same_named_type is None:
-                    print(f'>> \x1b[32m{s.name}\x1b[0m', file=sys.stderr)
+                    print(f'>> Duplicate type for \x1b[32m{s.name}\x1b[0m', file=sys.stderr)
                     all_structs.append(s)
                 elif same_named_type != s:
-                    print(f'\x1b[34mConflicting definitions for struct `{s.name}`\x1b[0m', file=sys.stderr)
+                    print(f'\x1b[31m\x1b[1mConflicting definitions for type `{s.name}`\x1b[0m', file=sys.stderr)
                     assert same_named_type == s
 
         output = sys.stdout
