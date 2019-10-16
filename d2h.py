@@ -18,8 +18,20 @@ def eprint(*args, **kwargs):
     print(*args, **kwargs, file=sys.stderr)
 
 
+def debug(*args, **kwargs):
+    print('\x1b[32m\x1b[1m', file=sys.stderr, end='')
+    print(*args, **kwargs, file=sys.stderr, end='')
+    print('\x1b[0m', file=sys.stderr)
+
+
 def info(*args, **kwargs):
     print('\x1b[34m\x1b[1m', file=sys.stderr, end='')
+    print(*args, **kwargs, file=sys.stderr, end='')
+    print('\x1b[0m', file=sys.stderr)
+
+
+def warn(*args, **kwargs):
+    print('\x1b[35m\x1b[1m', file=sys.stderr, end='')
     print(*args, **kwargs, file=sys.stderr, end='')
     print('\x1b[0m', file=sys.stderr)
 
@@ -49,7 +61,8 @@ class Type(object):
 
         self.state = STATE_IN_PROCESS
         self.do_finalize(types, finalization_order)
-        finalization_order.append(self)
+        if self not in finalization_order:
+            finalization_order.append(self)
         self.state = STATE_FINALIZED
 
     def do_finalize(self, types, finalization_order):
@@ -294,11 +307,15 @@ class Array(Type):
         self.item_type = die.attributes['DW_AT_type'].value
 
         self.dimensions = []
+        self.is_vla = False
         for c in die.iter_children():
             # This attribute is usually missing in VLAs (TODO: Not supported currently)
             if 'DW_AT_upper_bound' in c.attributes:
                 dimension = c.attributes['DW_AT_upper_bound'].value + 1
                 self.dimensions.append(dimension)
+            else:
+                assert self.is_vla is False
+                self.is_vla = True
 
     def do_finalize(self, types, finalization_order):
         # assert len(self.dimensions) > 0
@@ -327,6 +344,9 @@ class Array(Type):
         t = self.item_type.get_hydras_type()
         for d in self.dimensions[::-1]:
             t = f'Array({d}, {t})'
+
+        if self.is_vla:
+            t = f'VariableArray(0, 0xFFFFFFFF, {t})'
 
         return t
 
@@ -369,6 +389,9 @@ class Typedef(Type):
         return self.name
 
     def __eq__(self, other):
+        if not self.needs_to_generate_hydra():
+            return isinstance(other, Typedef) and other.name == self.name
+
         return isinstance(other, Typedef) and other.name == self.name and other.alias == self.alias
 
     def needs_to_generate_hydra(self) -> bool:
@@ -379,12 +402,9 @@ class Typedef(Type):
         if not self.needs_to_generate_hydra():
             return
 
+        if self.alias.is_pointer():
+            fp.write(f'# <POINTER> ({repr(self.alias)})\n')
         fp.write(f'{self.name} = {self.alias.get_hydras_type()}\n')
-
-    def is_pointer(self) -> bool:
-        if not self.needs_to_generate_hydra():
-            return False
-        return self.alias.is_pointer()
 
 
 class Pointer(Type):
@@ -456,12 +476,42 @@ class ConstType(Type):
         return self.item_type.is_pointer()
 
 
+class FunctionPointer(Type):
+    def __init__(self, die: DIE):
+        super().__init__(die)
+        self.die = die
+
+        self.parameters = []
+        for child in die.iter_children():
+            if die.tag != 'DW_TAG_formal_parameter':
+                continue
+            self.parameters.append(die.attributes['DW_AT_type'].value)
+
+    def get_type_dependencies(self) -> List[int]:
+        return self.parameters
+
+    def do_finalize(self, types, finalization_order):
+        self.parameters = [types[offset] for offset in self.parameters]
+        for typ in self.parameters:
+            typ.finalize(types, finalization_order)
+
+    def __repr__(self):
+        return f'void ({", ".join(self.parameters)})'
+
+    def get_hydras_type(self):
+        return None
+
+    def is_pointer(self) -> bool:
+        return True
+
+
 class UnsupportedType(Type):
     def __init__(self, die: DIE):
         super().__init__(die)
         self.die = die
 
     def do_finalize(self, types, finalization_order):
+        # debug(self.die.tag)
         pass
 
     def get_hydras_type(self):
@@ -478,6 +528,7 @@ TAG_TYPE_MAPPING = {
     'DW_TAG_const_type': ConstType,
     'DW_TAG_enumeration_type': EnumType,
     'DW_TAG_union_type': UnionType,
+    'DW_TAG_subroutine_type': FunctionPointer,
 }
 
 
@@ -522,7 +573,10 @@ def parse_dwarf_info(elf, whitelist_re, skip_duplicated_symbols):
                 if skip_duplicated_symbols:
                     types[offset] = aggregated_types_by_name[typ.name]
                 else:
-                    typ.finalize(types, finalization_order)
+                    # We still finalize the type so we could check it,
+                    # but we provide an empty list for the initialization order
+                    # so we could avoid duplicates
+                    typ.finalize(types, [])
                     if typ != aggregated_types_by_name[typ.name]:
                         error(f'Conflicting definitions for type `{typ.name}`')
                         info(f'First occurrence:')
