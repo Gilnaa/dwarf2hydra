@@ -30,21 +30,6 @@ def error(*args, **kwargs):
     print('\x1b[0m', file=sys.stderr)
 
 
-class PaddingDetails(object):
-    def __init__(self, prev_field, next_field):
-        self.prev_field = prev_field
-        self.next_field = next_field
-
-    def __repr__(self):
-        if self.next_field is None:
-            args = (self.prev_field[2], self.prev_field[0], self.prev_field[0] + self.prev_field[1].byte_size)
-            return "Trailing padding after member '%s', which spans %u:%u" % args
-
-        args = (self.prev_field[2], self.prev_field[0], self.prev_field[0] + self.prev_field[1].byte_size,
-                self.next_field[2], self.next_field[0])
-        return "Padding between '%s', which spans %u:%u, and '%s', which starts at %u" % args
-
-
 class Type(object):
     def __init__(self, die: DIE):
         self.source_object = die
@@ -69,12 +54,6 @@ class Type(object):
 
     def do_finalize(self, types, finalization_order):
         pass
-
-    def has_padding(self):
-        return False
-
-    def get_padding_list(self):
-        return []
 
     def get_location(self):
         node = self.source_object
@@ -102,6 +81,9 @@ class Type(object):
         :param fp: Output text stream
         """
         pass
+
+    def is_pointer(self) -> bool:
+        return False
 
 
 class Primitive(Type):
@@ -168,28 +150,6 @@ class Struct(Type):
     def get_type_dependencies(self):
         return (type_num for _, type_num, _ in self.members)
 
-    def has_padding(self):
-        return self.byte_size != sum(map(lambda dm: dm[1].byte_size, self.members)) or \
-            any(map(lambda dm: dm[1].has_padding(), self.members))
-
-    def get_padding_list(self):
-        pads = []
-        # Check for padding between fields
-        for i in range(len(self.members) - 1):
-            cur_offset, cur_type, _ = self.members[i]
-            next_offset, _, _ = self.members[i+1]
-            pad_size = next_offset - cur_offset - cur_type.byte_size
-
-            if pad_size > 0:
-                pads.append(PaddingDetails(self.members[i], self.members[i+1]))
-
-        last_member = self.members[-1]
-        trailing_pad_size = self.byte_size - (last_member[0] + last_member[1].byte_size)
-        if trailing_pad_size > 0:
-            pads.append(PaddingDetails(last_member, None))
-
-        return pads
-
     def __str__(self):
         return self.name
 
@@ -224,6 +184,9 @@ class Struct(Type):
                 fp.write(f'    _padding_{padding_counter} = Pad({offset - last_ending_offset})\n')
                 padding_counter += 1
             last_ending_offset = offset + member_type.byte_size
+
+            if member_type.is_pointer():
+                fp.write(f'    # <POINTER> ({repr(member_type)})\n')
 
             # Output the member itself
             fp.write(f'    {member_name} = {member_type.get_hydras_type()}\n')
@@ -262,9 +225,6 @@ class EnumType(Type):
             self.item_type = types[self.item_type]
             self.item_type.finalize(types, finalization_order)
             self.byte_size = self.item_type.byte_size
-
-    def has_padding(self):
-        return False
 
     def __repr__(self):
         return self.name
@@ -315,9 +275,6 @@ class UnionType(Type):
     def get_type_dependencies(self):
         return self.variants.values()
 
-    def has_padding(self):
-        return any(v.has_padding() for v in self.variants.values())
-
     def __repr__(self):
         return self.name
 
@@ -355,16 +312,11 @@ class Array(Type):
     def get_type_dependencies(self):
         return [self.item_type]
 
-    def has_padding(self):
-        return self.item_type.has_padding()
-
     def __repr__(self):
         if self.state != STATE_FINALIZED:
             return "<abstract array type>"
 
-        base_type = "<anonymous>"
-        if self.item_type.name is not None:
-            base_type = self.item_type.name
+        base_type = repr(self.item_type)
 
         for d in self.dimensions:
             base_type += f'[{d}]'
@@ -381,6 +333,9 @@ class Array(Type):
     def __eq__(self, other):
         return isinstance(other, Array) and other.dimensions == self.dimensions and other.item_type == self.item_type
 
+    def is_pointer(self) -> bool:
+        return self.item_type.is_pointer()
+
 
 class Typedef(Type):
     def __init__(self, die: DIE):
@@ -395,21 +350,22 @@ class Typedef(Type):
             self.alias = None
 
     def do_finalize(self, types, finalization_order):
-        if self.alias is not None:
+        if not self.needs_to_generate_hydra():
+            self.byte_size = int(re.match(r'u?int(8|16|32|64)_t', self.name).group(1)) // 8
+        elif self.alias is not None:
             self.alias = types[self.alias]
             self.alias.finalize(types, finalization_order)
             self.byte_size = self.alias.byte_size
 
     def get_type_dependencies(self):
+        if not self.needs_to_generate_hydra():
+            return []
         return [self.alias]
 
-    def has_padding(self):
-        return self.alias.has_padding()
-
-    def __repr__(self):
+    def get_hydras_type(self):
         return self.name
 
-    def get_hydras_type(self):
+    def __repr__(self):
         return self.name
 
     def __eq__(self, other):
@@ -424,6 +380,11 @@ class Typedef(Type):
             return
 
         fp.write(f'{self.name} = {self.alias.get_hydras_type()}\n')
+
+    def is_pointer(self) -> bool:
+        if not self.needs_to_generate_hydra():
+            return False
+        return self.alias.is_pointer()
 
 
 class Pointer(Type):
@@ -445,12 +406,12 @@ class Pointer(Type):
     def get_type_dependencies(self):
         return [self.item_type]
 
-    def has_padding(self):
-        return False
-
     def get_hydras_type(self):
         ptr_type = {4:  'uint32_t', 8: 'uint64_t'}[self.byte_size]
-        return f'{ptr_type}  # <POINTER>'
+        return f'{ptr_type}'
+
+    def is_pointer(self) -> bool:
+        return True
 
     def __eq__(self, other):
         return isinstance(other, Pointer) and other.name == self.name and other.item_type == self.item_type
@@ -480,9 +441,6 @@ class ConstType(Type):
     def get_type_dependencies(self):
         return [self.item_type]
 
-    def has_padding(self):
-        return self.item_type.has_padding()
-
     def get_hydras_type(self):
         return self.item_type.get_hydras_type()
 
@@ -494,6 +452,9 @@ class ConstType(Type):
             return 'const void'
         return f'const {repr(self.item_type)}'
 
+    def is_pointer(self) -> bool:
+        return self.item_type.is_pointer()
+
 
 class UnsupportedType(Type):
     def __init__(self, die: DIE):
@@ -502,9 +463,6 @@ class UnsupportedType(Type):
 
     def do_finalize(self, types, finalization_order):
         pass
-
-    def has_padding(self):
-        return False
 
     def get_hydras_type(self):
         return None
