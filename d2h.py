@@ -12,6 +12,7 @@ from collections import OrderedDict
 STATE_INITIAL = 0
 STATE_IN_PROCESS = 1
 STATE_FINALIZED = 2
+no_matrices = False
 
 
 def eprint(*args, **kwargs):
@@ -90,7 +91,6 @@ class Type(object):
     def generate_hydras_definition(self, fp: TextIO):
         """
         Generates top-level definitions for this type if needed.
-
         :param fp: Output text stream
         """
         pass
@@ -302,6 +302,7 @@ class UnionType(Type):
 
 class Array(Type):
     def __init__(self, die: DIE):
+        global no_matrices
         super().__init__(die)
 
         self.item_type = die.attributes['DW_AT_type'].value
@@ -312,7 +313,11 @@ class Array(Type):
             # This attribute is usually missing in VLAs (TODO: Not supported currently)
             if 'DW_AT_upper_bound' in c.attributes:
                 dimension = c.attributes['DW_AT_upper_bound'].value + 1
-                self.dimensions.append(dimension)
+
+                if no_matrices and len(self.dimensions) > 0:
+                    self.dimensions[0] = self.dimensions[0] * dimension
+                else:
+                    self.dimensions.append(dimension)
             else:
                 assert self.is_vla is False
                 self.is_vla = True
@@ -532,7 +537,7 @@ TAG_TYPE_MAPPING = {
 }
 
 
-def parse_dwarf_info(elf, whitelist_re, skip_duplicated_symbols):
+def parse_dwarf_info(elf, whitelist_re, skip_duplicated_symbols, no_matrices):
     # A mapping of `name: type` across all translation units.
     aggregated_types_by_name = {}
     # List of types by finalization order
@@ -614,6 +619,7 @@ def generate_hydra_file(structs, fp: TextIO):
 
 
 def main():
+    global no_matrices
     args = argparse.ArgumentParser(description='Parses an ELF file with DWARF debug symbols and generates Hydra '
                                                'definitions for the selected structs.'
                                                ''
@@ -622,11 +628,13 @@ def main():
     args.add_argument('--whitelist', help='A regex pattern used to choose structs for generation.'
                                           'May be specified multiple times.',
                       type=str, action='append', default=[])
+    args.add_argument('--no_matrices', help='Treat C matrices as long one dimensional arrays.', action='store_true')
     args.add_argument('-o', '--output', help='Name of output file.')
     args = args.parse_args()
 
     whitelist_re = re.compile('|'.join(map('(?:{0})'.format, args.whitelist)))
 
+    no_matrices = args.no_matrices
     with open(args.input_file, 'rb') as f:
         elf = ELFFile(f)
         if not elf.has_dwarf_info():
@@ -637,7 +645,7 @@ def main():
         if args.output is not None:
             output = open(args.output, 'w')
 
-        generate_hydra_file(parse_dwarf_info(elf, whitelist_re, True), output)
+        generate_hydra_file(parse_dwarf_info(elf, whitelist_re, True, args.no_matrices), output)
 
 
 if __name__ == '__main__':
